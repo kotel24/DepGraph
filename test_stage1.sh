@@ -19,12 +19,12 @@ repo: "./tests/repo"
 output_image: "./out/graph.png"
 max_depth: 5
 YAML
-python depgraph.py -c tests/config.yaml
+python depgraph.py -c tests/config.yaml --echo-config
 echo
 
 # 2. Отсутствие config.yaml
 echo "[2] Отсутствие config.yaml"
-python depgraph.py -c tests/no_file.yaml || true
+python depgraph.py -c tests/no_file.yaml --echo-config || true
 echo
 
 # 3. Ошибка синтаксиса YAML
@@ -32,7 +32,7 @@ echo "[3] Ошибка синтаксиса YAML"
 cat > tests/bad.yaml <<'YAML'
 package_name: [
 YAML
-python depgraph.py -c tests/bad.yaml || true
+python depgraph.py -c tests/bad.yaml --echo-config || true
 echo
 
 # 4. Отсутствующие ключи
@@ -40,7 +40,7 @@ echo "[4] Отсутствующие ключи"
 cat > tests/missing.yaml <<'YAML'
 package_name: "x"
 YAML
-python depgraph.py -c tests/missing.yaml || true
+python depgraph.py -c tests/missing.yaml --echo-config || true
 echo
 
 # 5. Некорректный package_name
@@ -52,7 +52,7 @@ repo: "./tests/repo"
 output_image: "./out/graph.png"
 max_depth: 5
 YAML
-python depgraph.py -c tests/bad_pkg.yaml || true
+python depgraph.py -c tests/bad_pkg.yaml --echo-config || true
 echo
 
 # 6. Некорректный repo_mode
@@ -64,7 +64,7 @@ repo: "./tests/repo"
 output_image: "./out/graph.png"
 max_depth: 5
 YAML
-python depgraph.py -c tests/bad_mode.yaml || true
+python depgraph.py -c tests/bad_mode.yaml --echo-config || true
 echo
 
 # 7. Неверный URL при repo_mode=url
@@ -76,7 +76,7 @@ repo: "example.com/repo"
 output_image: "./out/graph.png"
 max_depth: 5
 YAML
-python depgraph.py -c tests/bad_url.yaml || true
+python depgraph.py -c tests/bad_url.yaml --echo-config || true
 echo
 
 # 8. Некорректный локальный путь
@@ -88,7 +88,7 @@ repo: "./no_parent_dir_xxx/repo"
 output_image: "./out/graph.png"
 max_depth: 5
 YAML
-python depgraph.py -c tests/bad_local.yaml || true
+python depgraph.py -c tests/bad_local.yaml --echo-config || true
 echo
 
 # 9. Неподдерживаемое расширение выходного файла
@@ -100,7 +100,7 @@ repo: "./tests/repo"
 output_image: "./out/graph.bmp"
 max_depth: 5
 YAML
-python depgraph.py -c tests/bad_ext.yaml || true
+python depgraph.py -c tests/bad_ext.yaml --echo-config || true
 echo
 
 # 10. Некорректный max_depth
@@ -112,7 +112,7 @@ repo: "./tests/repo"
 output_image: "./out/graph.png"
 max_depth: 0
 YAML
-python depgraph.py -c tests/bad_depth.yaml || true
+python depgraph.py -c tests/bad_depth.yaml --echo-config || true
 echo
 
 echo "=== Тест завершён ==="

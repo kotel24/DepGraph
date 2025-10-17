@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal, Dict, Any
-import argparse, sys, os, re
+from typing import Literal, Dict, Any, List
+import argparse, sys, os, re, io, tarfile, urllib.request
 import yaml
 
 # ----------------------------- Ошибки -----------------------------
@@ -113,13 +113,69 @@ class Config:
             max_depth=max_depth
         )
 
+# ----------------------------- Этап 2: прямые зависимости из Alpine -----------------------------
+def _index_url(repo_url: str) -> str:
+    u = repo_url.strip()
+    return u if u.endswith("/APKINDEX.tar.gz") else u.rstrip("/") + "/APKINDEX.tar.gz"
+
+def _fetch_apkindex(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=30) as r:
+        data = r.read()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            if os.path.basename(m.name) == "APKINDEX":
+                f = tar.extractfile(m)
+                if not f:
+                    raise RuntimeError("Cannot extract APKINDEX file")
+                return f.read()
+    raise RuntimeError("APKINDEX not found inside archive")
+
+def _parse_apkindex(b: bytes) -> Dict[str, List[str]]:
+    text = b.decode("utf-8", errors="replace")
+    out: Dict[str, List[str]] = {}
+    for block in [e for e in text.split("\n\n") if e.strip()]:
+        pkg, deps = None, []
+        for line in block.splitlines():
+            if line.startswith("P:"):
+                pkg = line[2:].strip()
+            elif line.startswith("D:"):
+                toks = line[2:].split()
+                clean = []
+                for t in toks:
+                    if ":" in t:            # so:, cmd:, pc: — игнорируем
+                        continue
+                    name = re.split(r"[<>=~]", t, maxsplit=1)[0]
+                    if re.fullmatch(r"[A-Za-z0-9._+\-]+", name or ""):
+                        clean.append(name)
+                deps = clean
+        if pkg:
+            out[pkg] = deps
+    return out
+
+def print_direct_dependencies(repo_url: str, package_name: str) -> int:
+    try:
+        idx = _fetch_apkindex(_index_url(repo_url))
+    except Exception as e:
+        print(f"[error] Failed to download APKINDEX: {e}", file=sys.stderr)
+        return 1
+    mapping = _parse_apkindex(idx)
+    deps = mapping.get(package_name, [])
+    # Требование Этапа 2: вывести все прямые зависимости
+    for d in deps:
+        print(d)
+    if not deps:
+        print("(none)")
+    return 0
+
 # ----------------------------- CLI -----------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="depgraph",
-        description="Этап 1: минимальный CLI — читает YAML-конфиг, валидирует и печатает параметры."
+        description="Этап 2: сбор данных зависимостей (Alpine APKINDEX)."
     )
     p.add_argument("-c", "--config", required=True, help="Путь к YAML-файлу конфигурации.")
+    p.add_argument("--echo-config", action="store_true",
+                   help="Опционально: повторить поведение Этапа 1 (вывести параметры ключ=значение).")
     return p.parse_args(argv)
 
 def main(argv=None) -> int:
@@ -138,13 +194,20 @@ def main(argv=None) -> int:
         print(f"[error] {e}", file=sys.stderr)
         return 1
 
-    # Требование Этапа 1: вывести все настраиваемые параметры в формате ключ=значение.
-    print("package_name=", cfg.package_name, sep="")
-    print("repo=", cfg.repo, sep="")
-    print("repo_mode=", cfg.repo_mode, sep="")
-    print("output_image=", cfg.output_image, sep="")
-    print("max_depth=", cfg.max_depth, sep="")
-    return 0
+    # (необязательно) Этап 1-поведение — только если явно попросили
+    if args.echo_config:
+        print("package_name=", cfg.package_name, sep="")
+        print("repo=", cfg.repo, sep="")
+        print("repo_mode=", cfg.repo_mode, sep="")
+        print("output_image=", cfg.output_image, sep="")
+        print("max_depth=", cfg.max_depth, sep="")
+
+    # Этап 2 — обязательно: печатаем прямые зависимости указанного пакета (для URL-репозитория)
+    if cfg.repo_mode != "url":
+        print("[error] Stage 2 expects repo_mode='url' with an Alpine repository URL.", file=sys.stderr)
+        return 1
+
+    return print_direct_dependencies(cfg.repo, cfg.package_name)
 
 # ----------------------------- Точка входа -----------------------------
 if __name__ == "__main__":
