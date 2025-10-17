@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal, Dict, Any, List
+from typing import Literal, Dict, Any, List, Tuple, Set
 import argparse, sys, os, re, io, tarfile, urllib.request
 import yaml
 
@@ -17,9 +17,9 @@ RepoMode = Literal["url", "local"]
 @dataclass
 class Config:
     package_name: str           # Имя анализируемого пакета
-    repo: str                   # URL репозитория или локальный путь (в зависимости от режима)
-    repo_mode: RepoMode         # "url" | "local" — режим работы с тестовым репозиторием
-    output_image: str           # Имя/путь итогового файла изображения графа
+    repo: str                   # URL репозитория (url) или путь к файлу тестового графа (local)
+    repo_mode: RepoMode         # "url" | "local"
+    output_image: str           # Имя/путь итогового файла изображения графа (валидируем, но пока не используем)
     max_depth: int              # Максимальная глубина анализа
 
     # --- Загрузка из YAML ---
@@ -55,7 +55,7 @@ class Config:
         if isinstance(package_name, str):
             if not package_name.strip():
                 errors.append("package_name must be a non-empty string.")
-            if not re.fullmatch(r"[A-Za-z0-9._\-]+", package_name or ""):
+            if not re.fullmatch(r"[A-Za-z0-9._\\-]+", package_name or ""):
                 errors.append("package_name may contain only letters, digits, '.', '_' or '-'.")
         else:
             errors.append("package_name must be a string.")
@@ -113,7 +113,7 @@ class Config:
             max_depth=max_depth
         )
 
-# ----------------------------- Этап 2: прямые зависимости из Alpine -----------------------------
+# ----------------------------- Этап 2: прямые зависимости (APKINDEX) -----------------------------
 def _index_url(repo_url: str) -> str:
     u = repo_url.strip()
     return u if u.endswith("/APKINDEX.tar.gz") else u.rstrip("/") + "/APKINDEX.tar.gz"
@@ -130,7 +130,11 @@ def _fetch_apkindex(url: str) -> bytes:
                 return f.read()
     raise RuntimeError("APKINDEX not found inside archive")
 
-def _parse_apkindex(b: bytes) -> Dict[str, List[str]]:
+def _parse_apkindex(b: bytes, include_virtual: bool = False) -> Dict[str, List[str]]:
+    """
+    Парсит APKINDEX в {pkg: [deps]}.
+    include_virtual=False — игнорируем виртуальные so:/cmd:/pc:, оставляя только «обычные» пакетные имена.
+    """
     text = b.decode("utf-8", errors="replace")
     out: Dict[str, List[str]] = {}
     for block in [e for e in text.split("\n\n") if e.strip()]:
@@ -140,14 +144,16 @@ def _parse_apkindex(b: bytes) -> Dict[str, List[str]]:
                 pkg = line[2:].strip()
             elif line.startswith("D:"):
                 toks = line[2:].split()
-                clean = []
+                buf: List[str] = []
                 for t in toks:
-                    if ":" in t:            # so:, cmd:, pc: — игнорируем
+                    if ":" in t:            # so:, cmd:, pc:
+                        if include_virtual:
+                            buf.append(t.strip())
                         continue
                     name = re.split(r"[<>=~]", t, maxsplit=1)[0]
                     if re.fullmatch(r"[A-Za-z0-9._+\-]+", name or ""):
-                        clean.append(name)
-                deps = clean
+                        buf.append(name)
+                deps = buf
         if pkg:
             out[pkg] = deps
     return out
@@ -158,24 +164,155 @@ def print_direct_dependencies(repo_url: str, package_name: str) -> int:
     except Exception as e:
         print(f"[error] Failed to download APKINDEX: {e}", file=sys.stderr)
         return 1
-    mapping = _parse_apkindex(idx)
+    mapping = _parse_apkindex(idx, include_virtual=False)
     deps = mapping.get(package_name, [])
-    # Требование Этапа 2: вывести все прямые зависимости
     for d in deps:
         print(d)
     if not deps:
         print("(none)")
     return 0
 
+# ----------------------------- Этап 3: тестовый граф + итеративный DFS -----------------------------
+def load_test_graph_from_file(path: str) -> Dict[str, List[str]]:
+    """
+    Тестовый режим (repo_mode=local).
+    Формат файла (узлы — БОЛЬШИЕ латинские буквы):
+      # комментарии
+      A: B C
+      B: D
+      C:
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Test graph file not found: {path}")
+
+    mapping: Dict[str, List[str]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError(f"Invalid line {lineno}: expected 'NODE: deps...'")
+            left, right = line.split(":", 1)
+            node = left.strip()
+            if not re.fullmatch(r"[A-Z]+", node):
+                raise ValueError(f"Invalid node name at line {lineno}: '{node}', expected A..Z")
+            deps = [t for t in right.strip().split() if t]
+            for d in deps:
+                if not re.fullmatch(r"[A-Z]+", d):
+                    raise ValueError(f"Invalid dependency name at line {lineno}: '{d}', expected A..Z")
+            mapping[node] = deps
+
+    # Добавим пустые записи для узлов, встречающихся только как зависимости
+    for vlist in list(mapping.values()):
+        for v in vlist:
+            mapping.setdefault(v, [])
+    return mapping
+
+def build_full_graph_from_url(repo_url: str, include_virtual: bool = False) -> Dict[str, List[str]]:
+    """Строит граф {pkg: deps} из APKINDEX (по умолчанию без виртуальных зависимостей)."""
+    idx = _fetch_apkindex(_index_url(repo_url))
+    return _parse_apkindex(idx, include_virtual=include_virtual)
+
+def iterative_dfs(mapping: Dict[str, List[str]], start: str, max_depth: int
+                  ) -> Tuple[Set[Tuple[str, str]], List[str], List[List[str]]]:
+    """
+    Итеративный DFS (без рекурсии) с ограничением глубины.
+    Возвращает:
+      edges  — множество рёбер (u, v)
+      order  — порядок первого посещения вершин
+      cycles — список циклов, каждый как список узлов, замыкающийся в начало
+    """
+    if start not in mapping:
+        return set(), [], []
+
+    edges: Set[Tuple[str, str]] = set()
+    order: List[str] = []
+    cycles: List[List[str]] = []
+
+    # Кадр стека: (node, depth, next_child_index)
+    stack: List[Tuple[str, int, int]] = [(start, 0, 0)]
+    on_path: List[str] = []
+    on_path_set: Set[str] = set()
+    best_depth: Dict[str, int] = {}  # минимальная достигнутая глубина для узла
+
+    while stack:
+        node, depth, idx = stack.pop()
+
+        if idx == 0:
+            # вход в вершину
+            if node not in best_depth:
+                best_depth[node] = depth
+                order.append(node)
+            elif depth >= best_depth[node]:
+                continue
+            else:
+                best_depth[node] = depth
+
+            on_path.append(node)
+            on_path_set.add(node)
+
+        neighbors = mapping.get(node, [])
+        if depth < max_depth and idx < len(neighbors):
+            nei = neighbors[idx]
+            edges.add((node, nei))
+            # вернём текущий кадр с переходом к следующему соседу
+            stack.append((node, depth, idx + 1))
+
+            if nei in on_path_set:
+                # нашли цикл: от nei до текущего конца on_path + возврат к nei
+                try:
+                    k = on_path.index(nei)
+                    cycles.append(on_path[k:] + [nei])
+                except ValueError:
+                    pass
+                continue
+
+            if nei not in best_depth or depth + 1 < best_depth[nei]:
+                stack.append((nei, depth + 1, 0))
+        else:
+            # выход из вершины
+            if on_path and on_path[-1] == node:
+                on_path.pop()
+                on_path_set.discard(node)
+
+    return edges, order, cycles
+
+def print_graph_analysis(mapping: Dict[str, List[str]], start: str, max_depth: int) -> None:
+    edges, order, cycles = iterative_dfs(mapping, start, max_depth)
+
+    print(f"# dependency_graph (max_depth={max_depth})")
+    if edges:
+        for u, v in sorted(edges):
+            print(f"{u} -> {v}")
+    else:
+        print("(no edges)")
+
+    print("\n# order")
+    print(" -> ".join(order) if order else "(empty)")
+
+    print("\n# cycles")
+    if cycles:
+        for cyc in cycles:
+            print(" -> ".join(cyc))
+    else:
+        print("(none)")
+
 # ----------------------------- CLI -----------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="depgraph",
-        description="Этап 2: сбор данных зависимостей (Alpine APKINDEX)."
+        description=("Этап 3: построение полного графа зависимостей итеративным DFS с ограничением глубины и обработкой циклов. "
+                     "Этап 2: без --analyze печатает только прямые зависимости для URL-репозитория. "
+                     "Флагом --echo-config можно показать вывод параметров (Этап 1).")
     )
     p.add_argument("-c", "--config", required=True, help="Путь к YAML-файлу конфигурации.")
     p.add_argument("--echo-config", action="store_true",
-                   help="Опционально: повторить поведение Этапа 1 (вывести параметры ключ=значение).")
+                   help="(Опционально) Повторить поведение Этапа 1 — вывести параметры ключ=значение.")
+    p.add_argument("--analyze", action="store_true",
+                   help="Построить ПОЛНЫЙ граф зависимостей и вывести рёбра/порядок/циклы (Этап 3).")
+    p.add_argument("--include-virtual", action="store_true",
+                   help="Для URL-режима включать виртуальные зависимости (so:, cmd:, pc:) при анализе графа.")
     return p.parse_args(argv)
 
 def main(argv=None) -> int:
@@ -194,20 +331,42 @@ def main(argv=None) -> int:
         print(f"[error] {e}", file=sys.stderr)
         return 1
 
-    # (необязательно) Этап 1-поведение — только если явно попросили
+    # Опционально: показать параметры (поведение Этапа 1)
     if args.echo_config:
         print("package_name=", cfg.package_name, sep="")
         print("repo=", cfg.repo, sep="")
         print("repo_mode=", cfg.repo_mode, sep="")
         print("output_image=", cfg.output_image, sep="")
         print("max_depth=", cfg.max_depth, sep="")
+        print()
 
-    # Этап 2 — обязательно: печатаем прямые зависимости указанного пакета (для URL-репозитория)
-    if cfg.repo_mode != "url":
-        print("[error] Stage 2 expects repo_mode='url' with an Alpine repository URL.", file=sys.stderr)
-        return 1
+    # Этап 3 — тестовый режим: repo_mode=local => анализ графа из файла
+    if cfg.repo_mode == "local":
+        try:
+            mapping = load_test_graph_from_file(os.path.expanduser(cfg.repo))
+        except Exception as e:
+            print(f"[error] Failed to load test graph: {e}", file=sys.stderr)
+            return 1
+        if cfg.package_name not in mapping:
+            print(f"[warn] Start package '{cfg.package_name}' not found in test graph.", file=sys.stderr)
+        print_graph_analysis(mapping, cfg.package_name, cfg.max_depth)
+        return 0
 
-    return print_direct_dependencies(cfg.repo, cfg.package_name)
+    # repo_mode == "url"
+    if args.analyze:
+        # Полный анализ графа из APKINDEX (включать виртуальные зависимости при необходимости)
+        try:
+            mapping = build_full_graph_from_url(cfg.repo, include_virtual=args.include_virtual)
+        except Exception as e:
+            print(f"[error] Failed to build graph from APKINDEX: {e}", file=sys.stderr)
+            return 1
+        if cfg.package_name not in mapping:
+            print(f"[warn] Start package '{cfg.package_name}' not found in repository index.", file=sys.stderr)
+        print_graph_analysis(mapping, cfg.package_name, cfg.max_depth)
+        return 0
+    else:
+        # Этап 2: только прямые зависимости
+        return print_direct_dependencies(cfg.repo, cfg.package_name)
 
 # ----------------------------- Точка входа -----------------------------
 if __name__ == "__main__":
