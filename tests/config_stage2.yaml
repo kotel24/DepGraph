@@ -1,0 +1,5 @@
+package_name: "git"
+repo_mode: "url"
+repo: "https://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64"
+output_image: "./out/graph.png"
+max_depth: 5

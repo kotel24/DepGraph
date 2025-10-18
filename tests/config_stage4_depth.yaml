@@ -1,0 +1,5 @@
+package_name: "A"
+repo_mode: "local"
+repo: "./tests/repo_stage4_depth.txt"
+output_image: "./out/graph.png"
+max_depth: 2

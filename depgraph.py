@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Dict, Any, List, Tuple, Set
-import argparse, sys, os, re, io, tarfile, urllib.request
+import argparse, sys, os, re, io, tarfile, urllib.request, shutil, subprocess
 import yaml
 
 # ----------------------------- Ошибки -----------------------------
@@ -19,7 +19,7 @@ class Config:
     package_name: str           # Имя анализируемого пакета
     repo: str                   # URL репозитория (url) или путь к файлу тестового графа (local)
     repo_mode: RepoMode         # "url" | "local"
-    output_image: str           # Имя/путь итогового файла изображения графа (валидируем, но пока не используем)
+    output_image: str           # Путь итогового PNG (для этапа 5)
     max_depth: int              # Максимальная глубина анализа
 
     # --- Загрузка из YAML ---
@@ -298,13 +298,123 @@ def print_graph_analysis(mapping: Dict[str, List[str]], start: str, max_depth: i
     else:
         print("(none)")
 
+# ----------------------------- Этап 4: порядок загрузки -----------------------------
+def compute_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int
+                       ) -> Tuple[List[str], List[List[str]]]:
+    """Итеративный DFS: возвращает порядок загрузки (postorder), плюс найденные циклы (если есть)."""
+    if start not in mapping:
+        return [], []
+
+    load_order: List[str] = []        # reverse postorder (без дублей)
+    seen: Set[str] = set()
+    on_path: Set[str] = set()
+    cycles: List[List[str]] = []
+
+    # стек: (node, depth, state) ; state=0 -> enter, 1 -> exit
+    stack: List[Tuple[str, int, int]] = [(start, 0, 0)]
+    path: List[str] = []
+
+    while stack:
+        node, depth, state = stack.pop()
+
+        if state == 0:
+            if node in on_path:
+                try:
+                    k = path.index(node)
+                    cycles.append(path[k:] + [node])
+                except ValueError:
+                    pass
+                continue
+            if node not in seen:
+                seen.add(node)
+                on_path.add(node)
+                path.append(node)
+                stack.append((node, depth, 1))
+                if depth < max_depth:
+                    for nei in reversed(mapping.get(node, [])):
+                        stack.append((nei, depth + 1, 0))
+        else:
+            if path and path[-1] == node:
+                path.pop()
+            on_path.discard(node)
+            if node not in load_order:
+                load_order.append(node)
+
+    return load_order, cycles
+
+def print_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int) -> None:
+    order, cycles = compute_load_order(mapping, start, max_depth)
+
+    print(f"# load_order (max_depth={max_depth})")
+    print(" -> ".join(order) if order else "(empty)")
+
+    print("\n# cycles")
+    if cycles:
+        for cyc in cycles:
+            print(" -> ".join(cyc))
+    else:
+        print("(none)")
+
+# ----------------------------- Этап 5: ВИЗУАЛИЗАЦИЯ (Mermaid + PNG) -----------------------------
+def mermaid_from_edges(edges: Set[Tuple[str, str]], direction: str = "TD") -> str:
+    """
+    Строит Mermaid-диаграмму из рёбер.
+    direction: TD (top-down), LR (left-right), BT, RL
+    """
+    lines = [f"graph {direction}"]
+    for u, v in sorted(edges):
+        lines.append(f"  {u} --> {v}")
+    return "\n".join(lines) + "\n"
+
+def write_mermaid_and_png(mermaid_text: str, output_png_path: str) -> None:
+    """
+    Сохраняет Mermaid в .mmd рядом с PNG и пытается сгенерировать PNG через mermaid-cli (mmdc).
+    Если mmdc не найден — только сохраняет .mmd.
+    """
+    out_png = os.path.abspath(os.path.expanduser(output_png_path))
+    out_dir = os.path.dirname(out_png) or os.getcwd()
+    base, _ = os.path.splitext(out_png)
+    out_mmd = base + ".mmd"
+
+    # сохранить .mmd
+    with open(out_mmd, "w", encoding="utf-8") as f:
+        f.write(mermaid_text)
+
+    # попытаться отрендерить PNG через mmdc
+    mmdc = shutil.which("mmdc")
+    if mmdc:
+        try:
+            subprocess.run(
+                [mmdc, "-i", out_mmd, "-o", out_png],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            print(f"[info] PNG saved: {out_png}")
+        except subprocess.CalledProcessError as e:
+            print(f"[warn] mmdc failed: {e}. Mermaid saved at {out_mmd}", file=sys.stderr)
+    else:
+        print(f"[info] mermaid-cli (mmdc) not found. Mermaid saved at {out_mmd}", file=sys.stderr)
+
+def visualize_graph(mapping: Dict[str, List[str]], start: str, max_depth: int, output_png: str, direction: str = "TD") -> None:
+    """
+    Строит доступный подграф (по max_depth) и визуализирует его:
+      - печатает Mermaid в stdout
+      - сохраняет *.mmd
+      - пытается сохранить PNG в output_png
+    """
+    edges, _, _ = iterative_dfs(mapping, start, max_depth)
+    mermaid = mermaid_from_edges(edges, direction=direction)
+    print("# mermaid")
+    print(mermaid, end="")
+    write_mermaid_and_png(mermaid, output_png)
+
 # ----------------------------- CLI -----------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="depgraph",
-        description=("Этап 3: построение полного графа зависимостей итеративным DFS с ограничением глубины и обработкой циклов. "
-                     "Этап 2: без --analyze печатает только прямые зависимости для URL-репозитория. "
-                     "Флагом --echo-config можно показать вывод параметров (Этап 1).")
+        description=("Этап 5: визуализация (Mermaid + PNG). "
+                     "Этап 4: --load-order. Этап 3: --analyze. Этап 2: прямые deps (URL). Этап 1: --echo-config.")
     )
     p.add_argument("-c", "--config", required=True, help="Путь к YAML-файлу конфигурации.")
     p.add_argument("--echo-config", action="store_true",
@@ -313,6 +423,12 @@ def parse_args(argv=None):
                    help="Построить ПОЛНЫЙ граф зависимостей и вывести рёбра/порядок/циклы (Этап 3).")
     p.add_argument("--include-virtual", action="store_true",
                    help="Для URL-режима включать виртуальные зависимости (so:, cmd:, pc:) при анализе графа.")
+    p.add_argument("--load-order", action="store_true",
+                   help="(Этап 4) Порядок загрузки зависимостей.")
+    p.add_argument("--viz", action="store_true",
+                   help="(Этап 5) Визуализировать граф: Mermaid в stdout и .mmd; PNG в output_image (если есть mmdc).")
+    p.add_argument("--dir", default="TD",
+                   help="Направление Mermaid-графа: TD (по умолчанию), LR, BT, RL.")
     return p.parse_args(argv)
 
 def main(argv=None) -> int:
@@ -331,7 +447,7 @@ def main(argv=None) -> int:
         print(f"[error] {e}", file=sys.stderr)
         return 1
 
-    # Опционально: показать параметры (поведение Этапа 1)
+    # Этап 1 — по флагу
     if args.echo_config:
         print("package_name=", cfg.package_name, sep="")
         print("repo=", cfg.repo, sep="")
@@ -340,33 +456,48 @@ def main(argv=None) -> int:
         print("max_depth=", cfg.max_depth, sep="")
         print()
 
-    # Этап 3 — тестовый режим: repo_mode=local => анализ графа из файла
+    # Подготовим граф в зависимости от режима и флагов
+    mapping: Dict[str, List[str]]
+
     if cfg.repo_mode == "local":
         try:
             mapping = load_test_graph_from_file(os.path.expanduser(cfg.repo))
         except Exception as e:
             print(f"[error] Failed to load test graph: {e}", file=sys.stderr)
             return 1
+    else:  # url
+        if args.analyze or args.load_order or args.viz:
+            try:
+                mapping = build_full_graph_from_url(cfg.repo, include_virtual=args.include_virtual)
+            except Exception as e:
+                print(f"[error] Failed to build graph from APKINDEX: {e}", file=sys.stderr)
+                return 1
+        else:
+            # Этап 2: только прямые зависимости
+            return print_direct_dependencies(cfg.repo, cfg.package_name)
+
+    # Этап 5 — визуализация (имеет смысл на любом mapping)
+    if args.viz:
+        visualize_graph(mapping, cfg.package_name, cfg.max_depth, cfg.output_image, direction=args.dir)
+        return 0
+
+    # Этап 4 — порядок загрузки
+    if args.load_order:
+        print_load_order(mapping, cfg.package_name, cfg.max_depth)
+        return 0
+
+    # Этап 3 — общий анализ
+    if args.analyze:
         if cfg.package_name not in mapping:
-            print(f"[warn] Start package '{cfg.package_name}' not found in test graph.", file=sys.stderr)
+            print(f"[warn] Start package '{cfg.package_name}' not found in repository graph.", file=sys.stderr)
         print_graph_analysis(mapping, cfg.package_name, cfg.max_depth)
         return 0
 
-    # repo_mode == "url"
-    if args.analyze:
-        # Полный анализ графа из APKINDEX (включать виртуальные зависимости при необходимости)
-        try:
-            mapping = build_full_graph_from_url(cfg.repo, include_virtual=args.include_virtual)
-        except Exception as e:
-            print(f"[error] Failed to build graph from APKINDEX: {e}", file=sys.stderr)
-            return 1
-        if cfg.package_name not in mapping:
-            print(f"[warn] Start package '{cfg.package_name}' not found in repository index.", file=sys.stderr)
-        print_graph_analysis(mapping, cfg.package_name, cfg.max_depth)
+    if cfg.repo_mode == "local":
+        print("[info] For local test graph use: --viz (Stage 5), --load-order (Stage 4) or --analyze (Stage 3).")
         return 0
-    else:
-        # Этап 2: только прямые зависимости
-        return print_direct_dependencies(cfg.repo, cfg.package_name)
+
+    return 0
 
 # ----------------------------- Точка входа -----------------------------
 if __name__ == "__main__":

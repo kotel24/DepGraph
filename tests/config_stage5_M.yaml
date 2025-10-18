@@ -1,0 +1,5 @@
+package_name: "M"
+repo_mode: "local"
+repo: "./tests/repo_stage5.txt"
+output_image: "./out/graph_M.png"
+max_depth: 2
