@@ -1,0 +1,5 @@
+package_name: "A"
+repo_mode: "local"
+repo: "./tests/repo_graph_cycle.txt"
+output_image: "./out/graph.png"
+max_depth: 5

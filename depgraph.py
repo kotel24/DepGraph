@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Dict, Any, List, Tuple, Set
-import argparse, sys, os, re, io, tarfile, urllib.request
+import argparse, sys, os, re, io, tarfile, urllib.request, shutil, subprocess
 import yaml
 
 # ----------------------------- Ошибки -----------------------------
@@ -19,7 +19,7 @@ class Config:
     package_name: str           # Имя анализируемого пакета
     repo: str                   # URL репозитория (url) или путь к файлу тестового графа (local)
     repo_mode: RepoMode         # "url" | "local"
-    output_image: str           # Имя/путь итогового файла изображения графа (валидируем, но пока не используем)
+    output_image: str           # Путь итогового PNG (для этапа 5)
     max_depth: int              # Максимальная глубина анализа
 
     # --- Загрузка из YAML ---
@@ -298,14 +298,10 @@ def print_graph_analysis(mapping: Dict[str, List[str]], start: str, max_depth: i
     else:
         print("(none)")
 
-# ----------------------------- Этап 4: порядок загрузки (топологический) -----------------------------
+# ----------------------------- Этап 4: порядок загрузки -----------------------------
 def compute_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int
                        ) -> Tuple[List[str], List[List[str]]]:
-    """
-    Возвращает порядок загрузки зависимостей (зависимости раньше зависящих).
-    Итеративный DFS без рекурсии, учитываем max_depth.
-    Если есть циклы — возвращаем частичный порядок (reverse postorder) и список циклов.
-    """
+    """Итеративный DFS: возвращает порядок загрузки (postorder), плюс найденные циклы (если есть)."""
     if start not in mapping:
         return [], []
 
@@ -314,17 +310,15 @@ def compute_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int
     on_path: Set[str] = set()
     cycles: List[List[str]] = []
 
-    # стек кадров: (node, depth, idx, state) ; state=0 -> enter, 1 -> exit
-    stack: List[Tuple[str, int, int, int]] = [(start, 0, 0, 0)]
+    # стек: (node, depth, state) ; state=0 -> enter, 1 -> exit
+    stack: List[Tuple[str, int, int]] = [(start, 0, 0)]
     path: List[str] = []
 
-    # чтобы не зависеть от порядка ключей dict, фиксируем порядок соседей как в списке
     while stack:
-        node, depth, idx, state = stack.pop()
+        node, depth, state = stack.pop()
 
         if state == 0:
             if node in on_path:
-                # цикл — найдём путь из node в текущем path
                 try:
                     k = path.index(node)
                     cycles.append(path[k:] + [node])
@@ -335,37 +329,24 @@ def compute_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int
                 seen.add(node)
                 on_path.add(node)
                 path.append(node)
-
-                # планируем выходной шаг
-                stack.append((node, depth, 0, 1))
-
-                # раскрываем соседей
-                neighbors = mapping.get(node, [])
+                stack.append((node, depth, 1))
                 if depth < max_depth:
-                    # добавляем в стек в обратном порядке, чтобы первый сосед обрабатывался первым
-                    for nei in reversed(neighbors):
-                        stack.append((nei, depth + 1, 0, 0))
-            # иначе: уже обработан и в load_order (или будет при выходе)
+                    for nei in reversed(mapping.get(node, [])):
+                        stack.append((nei, depth + 1, 0))
         else:
-            # выход из вершины: добавляем в load_order
             if path and path[-1] == node:
                 path.pop()
             on_path.discard(node)
             if node not in load_order:
                 load_order.append(node)
 
-    # в load_order сейчас *зависимости раньше зависящих*, так как мы добавляем «на выходе» (postorder)
     return load_order, cycles
 
 def print_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int) -> None:
     order, cycles = compute_load_order(mapping, start, max_depth)
 
     print(f"# load_order (max_depth={max_depth})")
-    if order:
-        # как правило, последним будет стартовый пакет
-        print(" -> ".join(order))
-    else:
-        print("(empty)")
+    print(" -> ".join(order) if order else "(empty)")
 
     print("\n# cycles")
     if cycles:
@@ -374,13 +355,66 @@ def print_load_order(mapping: Dict[str, List[str]], start: str, max_depth: int) 
     else:
         print("(none)")
 
+# ----------------------------- Этап 5: ВИЗУАЛИЗАЦИЯ (Mermaid + PNG) -----------------------------
+def mermaid_from_edges(edges: Set[Tuple[str, str]], direction: str = "TD") -> str:
+    """
+    Строит Mermaid-диаграмму из рёбер.
+    direction: TD (top-down), LR (left-right), BT, RL
+    """
+    lines = [f"graph {direction}"]
+    for u, v in sorted(edges):
+        lines.append(f"  {u} --> {v}")
+    return "\n".join(lines) + "\n"
+
+def write_mermaid_and_png(mermaid_text: str, output_png_path: str) -> None:
+    """
+    Сохраняет Mermaid в .mmd рядом с PNG и пытается сгенерировать PNG через mermaid-cli (mmdc).
+    Если mmdc не найден — только сохраняет .mmd.
+    """
+    out_png = os.path.abspath(os.path.expanduser(output_png_path))
+    out_dir = os.path.dirname(out_png) or os.getcwd()
+    base, _ = os.path.splitext(out_png)
+    out_mmd = base + ".mmd"
+
+    # сохранить .mmd
+    with open(out_mmd, "w", encoding="utf-8") as f:
+        f.write(mermaid_text)
+
+    # попытаться отрендерить PNG через mmdc
+    mmdc = shutil.which("mmdc")
+    if mmdc:
+        try:
+            subprocess.run(
+                [mmdc, "-i", out_mmd, "-o", out_png],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            print(f"[info] PNG saved: {out_png}")
+        except subprocess.CalledProcessError as e:
+            print(f"[warn] mmdc failed: {e}. Mermaid saved at {out_mmd}", file=sys.stderr)
+    else:
+        print(f"[info] mermaid-cli (mmdc) not found. Mermaid saved at {out_mmd}", file=sys.stderr)
+
+def visualize_graph(mapping: Dict[str, List[str]], start: str, max_depth: int, output_png: str, direction: str = "TD") -> None:
+    """
+    Строит доступный подграф (по max_depth) и визуализирует его:
+      - печатает Mermaid в stdout
+      - сохраняет *.mmd
+      - пытается сохранить PNG в output_png
+    """
+    edges, _, _ = iterative_dfs(mapping, start, max_depth)
+    mermaid = mermaid_from_edges(edges, direction=direction)
+    print("# mermaid")
+    print(mermaid, end="")
+    write_mermaid_and_png(mermaid, output_png)
+
 # ----------------------------- CLI -----------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="depgraph",
-        description=("Этап 4: вывод порядка загрузки зависимостей (топологический порядок). "
-                     "Этап 3: анализ графа (--analyze). Этап 2: прямые зависимости (URL). "
-                     "Этап 1: --echo-config печатает параметры ключ=значение.")
+        description=("Этап 5: визуализация (Mermaid + PNG). "
+                     "Этап 4: --load-order. Этап 3: --analyze. Этап 2: прямые deps (URL). Этап 1: --echo-config.")
     )
     p.add_argument("-c", "--config", required=True, help="Путь к YAML-файлу конфигурации.")
     p.add_argument("--echo-config", action="store_true",
@@ -390,7 +424,11 @@ def parse_args(argv=None):
     p.add_argument("--include-virtual", action="store_true",
                    help="Для URL-режима включать виртуальные зависимости (so:, cmd:, pc:) при анализе графа.")
     p.add_argument("--load-order", action="store_true",
-                   help="(Только для Этапа 4) Вывести порядок загрузки зависимостей для заданного пакета.")
+                   help="(Этап 4) Порядок загрузки зависимостей.")
+    p.add_argument("--viz", action="store_true",
+                   help="(Этап 5) Визуализировать граф: Mermaid в stdout и .mmd; PNG в output_image (если есть mmdc).")
+    p.add_argument("--dir", default="TD",
+                   help="Направление Mermaid-графа: TD (по умолчанию), LR, BT, RL.")
     return p.parse_args(argv)
 
 def main(argv=None) -> int:
@@ -428,7 +466,7 @@ def main(argv=None) -> int:
             print(f"[error] Failed to load test graph: {e}", file=sys.stderr)
             return 1
     else:  # url
-        if args.analyze or args.load_order:
+        if args.analyze or args.load_order or args.viz:
             try:
                 mapping = build_full_graph_from_url(cfg.repo, include_virtual=args.include_virtual)
             except Exception as e:
@@ -438,22 +476,25 @@ def main(argv=None) -> int:
             # Этап 2: только прямые зависимости
             return print_direct_dependencies(cfg.repo, cfg.package_name)
 
-    # Этап 4: если попросили порядок загрузки — печатаем его и выходим
+    # Этап 5 — визуализация (имеет смысл на любом mapping)
+    if args.viz:
+        visualize_graph(mapping, cfg.package_name, cfg.max_depth, cfg.output_image, direction=args.dir)
+        return 0
+
+    # Этап 4 — порядок загрузки
     if args.load_order:
         print_load_order(mapping, cfg.package_name, cfg.max_depth)
         return 0
 
-    # Этап 3: анализ графа (рёбра/порядок посещения/циклы)
+    # Этап 3 — общий анализ
     if args.analyze:
         if cfg.package_name not in mapping:
             print(f"[warn] Start package '{cfg.package_name}' not found in repository graph.", file=sys.stderr)
         print_graph_analysis(mapping, cfg.package_name, cfg.max_depth)
         return 0
 
-    # Если пользователь не указал ни --load-order, ни --analyze в local-режиме —
-    # явно подскажем, что делать.
     if cfg.repo_mode == "local":
-        print("[info] For local test graph use one of: --analyze (Stage 3) or --load-order (Stage 4).")
+        print("[info] For local test graph use: --viz (Stage 5), --load-order (Stage 4) or --analyze (Stage 3).")
         return 0
 
     return 0

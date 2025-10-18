@@ -1,0 +1,5 @@
+package_name: "ok"
+repo_mode: "local"
+repo: "./no_parent_dir_xxx/repo"
+output_image: "./out/graph.png"
+max_depth: 5

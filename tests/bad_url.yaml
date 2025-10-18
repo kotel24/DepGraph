@@ -1,0 +1,5 @@
+package_name: "ok"
+repo_mode: "url"
+repo: "example.com/repo"
+output_image: "./out/graph.png"
+max_depth: 5
